@@ -2,7 +2,7 @@
 // Timeline Aktivitas Karyawan - server tanpa dependensi (Node 18+)
 const http=require('http'),fs=require('fs'),path=require('path'),crypto=require('crypto');
 const PORT=+process.env.PORT||3000,DIR=process.env.DATA_DIR||path.join(__dirname,'data'),FILE=path.join(DIR,'db.json'),SECURE=process.env.COOKIE_SECURE==='1';
-fs.mkdirSync(DIR,{recursive:true});
+const UP=path.join(DIR,'uploads');fs.mkdirSync(UP,{recursive:true});
 let db={users:[],sessions:{},activities:[],ver:0};
 try{db=Object.assign(db,JSON.parse(fs.readFileSync(FILE,'utf8')))}catch(e){}
 let tmr=null;function snap(){const d=path.join(DIR,'backup-'+new Date().toISOString().slice(0,10)+'.json');if(!fs.existsSync(d)&&fs.existsSync(FILE)){try{fs.copyFileSync(FILE,d);fs.readdirSync(DIR).filter(f=>f.startsWith('backup-')).sort().slice(0,-14).forEach(f=>fs.unlinkSync(path.join(DIR,f)))}catch(e){}}}
@@ -18,10 +18,14 @@ function authed(req){if(OPEN){let n='Tamu';try{n=decodeURIComponent(req.headers[
 function sid(res,uid){const t=crypto.randomBytes(32).toString('hex');db.sessions[t]={uid,exp:Date.now()+30*864e5};persist();return{'Set-Cookie':`sid=${t}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${30*86400}${SECURE?'; Secure':''}`}}
 const pub=u=>({id:u.id,name:u.name,email:u.email,role:u.role});
 const str=(v,n)=>String(v==null?'':v).slice(0,n);
-function cleanRec(r){r=r||{};return r.done?{done:true,actual:+r.actual||0,sat:Math.max(0,Math.min(5,+r.sat||0)),result:str(r.result,2000)}:{done:false}}
+function cleanRec(r){r=r||{};return r.done?{done:true,actual:+r.actual||0,sat:Math.max(0,Math.min(5,+r.sat||0)),people:Math.max(0,Math.min(1e6,Math.floor(+r.people||0))),files:(Array.isArray(r.files)?r.files:[]).slice(0,5).filter(x=>x&&FRE.test(String(x.f))).map(x=>({f:x.f,n:str(x.n,60)})),result:str(r.result,2000)}:{done:false}}
 function cleanAct(a,u){if(!a||typeof a.id!=='string'||!a.name)throw new Error('Data agenda tidak valid');const rec={};for(const k of Object.keys(a.rec||{}).slice(0,400)){const old=a.rec[k]||{};rec[k]=cleanRec(old);if(rec[k].done){rec[k].by=str(old.by,60)||u.name}}
  return{id:str(a.id,40).replace(/[^\w-]/g,''),name:str(a.name,80),cat:str(a.cat,40),pic:str(a.pic,40),type:['event','weekly','monthly','quarterly','annually'].includes(a.type)?a.type:'event',start:str(a.start,10),end:str(a.end,10),budget:+a.budget||0,impact:str(a.impact,500),rec}}
 const need=(u,r)=>{if(!u)throw Object.assign(new Error('Silakan login'),{c:401});if(RANK[u.role]<RANK[r])throw Object.assign(new Error('Tidak punya izin untuk aksi ini'),{c:403})};
+const FRE=/^[a-f0-9]{24}\.(jpg|png|pdf)$/;
+function raw(req,max){return new Promise((ok,no)=>{const c=[];let n=0,bad=false;req.on('data',d=>{n+=d.length;if(n>max)bad=true;else c.push(d)});req.on('end',()=>bad?no(new Error('File terlalu besar (maks. 5 MB)')):ok(Buffer.concat(c)));req.on('error',()=>no(new Error('Unggahan gagal')))})}
+function gc(){try{const used=new Set();for(const a of db.activities)for(const r of Object.values(a.rec||{}))for(const x of r.files||[])used.add(x.f);for(const f of fs.readdirSync(UP)){const fp=path.join(UP,f);if(!used.has(f)&&Date.now()-fs.statSync(fp).mtimeMs>36e5)fs.unlinkSync(fp)}}catch(e){}}
+setInterval(gc,36e5);
 const MIME={'.html':'text/html; charset=utf-8'};
 http.createServer(async(req,res)=>{
  const url=new URL(req.url,'http://x'),p=url.pathname,m=req.method;
@@ -31,7 +35,7 @@ http.createServer(async(req,res)=>{
  if(!p.startsWith('/api/')){res.writeHead(404);return res.end('Not found')}
  try{
   const u=authed(req);
-  if(m!=='GET'&&!/application\/json/.test(req.headers['content-type']||''))throw Object.assign(new Error('Content-Type harus JSON'),{c:415});
+  if(m!=='GET'&&p!=='/api/upload'&&!/application\/json/.test(req.headers['content-type']||''))throw Object.assign(new Error('Content-Type harus JSON'),{c:415});
   if(p==='/api/me')return send(res,200,{user:u?pub(u):null,setup:db.users.length===0,open:OPEN});
   if(p==='/api/register'&&m==='POST'){const b=await body(req),email=str(b.email,120).trim().toLowerCase(),name=str(b.name,60).trim();
    if(!name)throw new Error('Nama wajib diisi');if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))throw new Error('Format email tidak valid');if(str(b.password,200).length<8)throw new Error('Password minimal 8 karakter');
@@ -44,6 +48,13 @@ http.createServer(async(req,res)=>{
    tries.delete(key);return send(res,200,{user:pub(x)},sid(res,x.id))}
   if(p==='/api/logout'&&m==='POST'){const c=/sid=([a-f0-9]+)/.exec(req.headers.cookie||'');if(c)delete db.sessions[c[1]];persist();return send(res,200,{ok:1},{'Set-Cookie':'sid=; Path=/; Max-Age=0'})}
   need(u,'viewer');
+  if(p==='/api/upload'&&m==='POST'){need(u,'member');if(!req.headers['x-requested-with'])throw new Error('Permintaan tidak valid');
+   const ty=(req.headers['content-type']||'').split(';')[0],ext={'image/jpeg':'jpg','image/png':'png','application/pdf':'pdf'}[ty];if(!ext)throw new Error('Hanya file JPG, PNG, atau PDF');
+   const buf=await raw(req,5*1024*1024),ok=ext==='jpg'?buf.slice(0,3).equals(Buffer.from([255,216,255])):ext==='png'?buf.slice(0,4).equals(Buffer.from([137,80,78,71])):buf.slice(0,4).toString()==='%PDF';
+   if(!ok)throw new Error('Isi file tidak sesuai dengan formatnya');
+   const f=crypto.randomBytes(12).toString('hex')+'.'+ext;fs.writeFileSync(path.join(UP,f),buf);let n='file';try{n=decodeURIComponent(url.searchParams.get('n')||'file')}catch(e){}return send(res,200,{f,n:str(n,60)})}
+  if(p.startsWith('/api/file/')&&m==='GET'){const f=p.slice(10),fp=path.join(UP,f);if(!FRE.test(f)||!fs.existsSync(fp))throw Object.assign(new Error('File tidak ditemukan'),{c:404});
+   res.removeHeader('Content-Security-Policy');res.writeHead(200,{'Content-Type':{jpg:'image/jpeg',png:'image/png',pdf:'application/pdf'}[f.split('.')[1]],'Cache-Control':'private, max-age=86400'});return fs.createReadStream(fp).pipe(res)}
   if(p==='/api/events'){res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-store',Connection:'keep-alive'});res.write('retry: 2000\n\n');sse.add(res);const ka=setInterval(()=>res.write(': ka\n\n'),25000);return req.on('close',()=>{sse.delete(res);clearInterval(ka)})}
   if(p==='/api/state'&&m==='GET')return send(res,200,{activities:db.activities,ver:db.ver});
   if(p==='/api/activity'&&m==='PUT'){need(u,'admin');const a=cleanAct(await body(req),u),i=db.activities.findIndex(x=>x.id===a.id);if(i>-1)db.activities[i]=a;else db.activities.push(a);bump();return send(res,200,{ok:1})}
